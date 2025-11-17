@@ -1,64 +1,122 @@
-import { createContext, useState, useEffect, ReactNode } from "react";
-import api from "../services/api";
+import React, { createContext, useEffect, useMemo, useState } from "react";
+import authApi from "../api/authClient";
+import api from "../api/api";
+import { LoginResponse, User } from "../types/auth";
+import { normalizeApiError } from "../utils/error";
+import { getItem, setItem, removeItem } from "../services/storage";
+import { ACCESS_TOKEN_KEY } from "../constants";
 
-interface User {
-  email: string;
-}
+/**
+ * Auth flow assumptions:
+ * - /auth/login returns { accessToken, user } and sets HttpOnly refresh cookie
+ * - /auth/refresh uses refresh cookie to return { accessToken, user }
+ * - /auth/logout clears refresh cookie
+ *
+ * We will:
+ * - store accessToken in-memory via authClient.setAccessToken
+ * - optionally persist accessToken in SecureStore for instant app resume
+ * - run refresh on app startup to populate user if cookie exists
+ */
 
-interface AuthContextValue {
+interface AuthState {
   user: User | null;
-  accessToken: string | null;
-  login: (email: string, password: string) => Promise<void>;
-  logout: () => void;
   loading: boolean;
+  login: (email: string, password: string) => Promise<void>;
+  signup: (email: string, password: string) => Promise<void>;
+  logout: () => Promise<void>;
+  accessToken: string | null;
 }
 
-export const AuthContext = createContext<AuthContextValue>({
+export const AuthContext = createContext<AuthState>({
   user: null,
-  accessToken: null,
-  login: async () => {},
-  logout: () => {},
   loading: true,
+  login: async () => {},
+  signup: async () => {},
+  logout: async () => {},
+  accessToken: null,
 });
 
-export default function AuthProvider({ children }: { children: ReactNode }) {
+export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(null);
-  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [accessToken, setAccessTokenLocal] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Load token from refresh-token cookie using /refresh
+  // helper to sync token with auth client
+  const setAccessToken = (token: string | null) => {
+    setAccessTokenLocal(token);
+    // write to authClient in-memory
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const authClientModule = require("../api/authClient");
+    authClientModule.setAccessToken(token);
+  };
+
   useEffect(() => {
-    const load = async () => {
+    const init = async () => {
       try {
-        const res = await api.post("/auth/refresh");
-        setAccessToken(res.data.accessToken);
-        setUser(res.data.user);
-      } catch {}
-      setLoading(false);
+        setLoading(true);
+        // Try to refresh using cookie-based refresh token
+        const resp = await api.post("/auth/refresh"); // uses withCredentials
+        const { accessToken: t, user: u } = resp.data as LoginResponse;
+        setAccessToken(t);
+        setUser(u);
+        // optionally persist token
+        await setItem(ACCESS_TOKEN_KEY, t);
+      } catch (err) {
+        // no cookie or refresh failed
+        setAccessToken(null);
+        setUser(null);
+        await removeItem(ACCESS_TOKEN_KEY);
+      } finally {
+        setLoading(false);
+      }
     };
-    load();
+    init();
   }, []);
 
   const login = async (email: string, password: string) => {
-    const res = await api.post("/auth/login", { email, password });
-
-    setAccessToken(res.data.accessToken);
-    (global as any).accessToken = res.data.accessToken;  // for axios interceptor
-    setUser(res.data.user);
+    try {
+      const resp = await api.post("/auth/login", { email, password });
+      const { accessToken: t, user: u } = resp.data as LoginResponse;
+      setAccessToken(t);
+      setUser(u);
+      await setItem(ACCESS_TOKEN_KEY, t);
+    } catch (err) {
+      const e = normalizeApiError(err);
+      throw e;
+    }
   };
 
-  const logout = () => {
-    setUser(null);
-    setAccessToken(null);
-    (global as any).accessToken = null;
-    api.post("/auth/logout");
+  const signup = async (email: string, password: string) => {
+    try {
+      const resp = await api.post("/auth/signup", { email, password });
+      const { accessToken: t, user: u } = resp.data as LoginResponse;
+      setAccessToken(t);
+      setUser(u);
+      await setItem(ACCESS_TOKEN_KEY, t);
+    } catch (err) {
+      const e = normalizeApiError(err);
+      throw e;
+    }
   };
 
-  return (
-    <AuthContext.Provider
-      value={{ user, accessToken, login, logout, loading }}
-    >
-      {children}
-    </AuthContext.Provider>
+  const logout = async () => {
+    try {
+      // ask backend to clear refresh cookie
+      await api.post("/auth/logout");
+    } catch (err) {
+      // ignore errors on logout
+      console.warn("logout error", err);
+    } finally {
+      setAccessToken(null);
+      setUser(null);
+      await removeItem(ACCESS_TOKEN_KEY);
+    }
+  };
+
+  const value = useMemo(
+    () => ({ user, loading, login, signup, logout, accessToken }),
+    [user, loading, accessToken]
   );
-}
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+};
